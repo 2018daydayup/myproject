@@ -1,0 +1,89 @@
+小而巧的zval(16个字节的大小)
+  定义：
+	struct _zval_struct{
+		zend_val value;
+		union {
+			struct{
+				ZEND_ENDIAN_LOHI_4(
+					zend_uchar type,		//定义类型（php变量类型）
+					zend_uchar type_flags,	//变量类型特有的标记
+					zend_uchar const_flags,	//常量类型标记
+					zend_uchar reserved)	//保留字段
+			}v;
+			uint32_t type_info;
+		}u1;
+		union{
+			uint32_t	next;		//用于解决hshs冲突（数组中会使用）
+			uint32_t	cache_slot; //做运行时缓存
+			uint32_t	lineno;		//标记对应php的哪一行
+			uint32_t	num_args;	//函数参数个数
+			uint32_t	fe_pos;		//foreach时的位置
+			uint32_t	fe_iter_idx;	//游标索引位置
+			uint32_t	access_flags;	//主要用在类中做类型标记
+			uint32_t	property_guard; //防止类中魔术方法的循环引用
+		}u2;
+	};
+    typedef union _zend_value{
+		zend_long 	lval;//整形
+		double 		dval;//浮点型
+		zend_refcounted	*counted;
+		zend_string		*str;//字符串
+		zend_array		*arr;//数组
+		zend_object		*obj;//对象
+		zend_resource	*res;//资源
+		zend_reference	*ref;//引用
+		......
+		void			*ptr;
+		zend_class_entry *ce;//类
+		zend_function	 *func;//函数（方法）
+		......
+	}zend_value;
+
+	虽然在使用php的时候可以不用给定变量的类型，但在顶层实现（解析时）时是区分变量类型。我们在实现过程中不用去关心变量的类型，但在底层做了很多的转换来区分变量类型。
+	php的弱类型特性是通过_zval_struct这个结构特来实现的,这个结构用来定义php中的所有数据类型，zend_val value也是一个结构体，用于保存变量真正的值，会根据u1这个联合体中的type字段确定变量的类型，分配指定大小的空间。而在u2这个联合体中有一个next变量，这个变量在定义的基本数据类型为数组的时候会使用到。因为php定义数组的结构体又叫HashTable，而HashTable在使用时存在冲突，这个变量就是用于解决此冲突的，解决冲突的方法为拉链法，形成一个链表（采用头插的方式进行插入）。
+
+	zend_string类型：
+	struct _zend_string{
+		zend_refcounted_h 	gc;		//用于垃圾回收（引用计数）
+		zend_ulong			h;		//字符串对应的哈希值（用于数组中）
+		size_t				len;	//长度
+		char				var[1];	//存放字符串内容
+	}; //php实现的字符串时二进制安全的，通过一个len来定义字符串的长度
+
+	可以看到，php的字符串类型为一个_zend_string的结构体，这个结构体通过一个引用计数gc变量来记录当前字符串被引用的次数。对于h这个变量我的理解是当该字符串作为数组的下标时即为hash数组的键时，根据HashTable存储的特性可知需要一个h值来保存键，这个h值就是起到这样的作用。c语言中的字符串是与'/0'为结束的标识的，但这样会导致不能识别'/0'这个字符与其后边的内容，所以php的字符串做了一个二进制安全的功能，通过一个len变量来记录字符串的大小，这样就不受'/0'这个字符的影响了。而真正存储内容是有一个var[1]的数组来完成，而不使用char*是为了节省内存，因为char var[1]这个数组也能完成数据内容的存储。
+
+	zend_array类型：	别名hashtable
+	struct _zend_array{
+		zend_refcounted_h gc;
+		union{
+			struct{
+				ZEND_ENDIAN_LOHI_4(
+					zend_uchar	flags,
+					zend_uchar	nApplyCount,
+					zend_uchar	nIteratorsCount,
+					zend_uchar	consistency)
+			}v;
+			uint32_t flags;
+		}u;
+		uint32_t	nTableMask;			//计算索引值
+		Bucket		*arData;			//存储key-value对
+		uint32_t	nNumUsed;			//存储已经使用了的空间
+		uint32_t	nNumOfElemments;	//真正的元素个数
+		uint32_t	nTableSize;			//arData的大小（初始默认大小为8，每次以2倍大小扩容）
+		uint32_t	nInternalPointer;	
+		uint32_t	nNextFreeElement;	//给定下一个键值
+		dtor_func_t	pDestructor;
+	};
+
+	HashTable是php最为重要的数据结构，最常见的数组就是通过他来实现的，所以php中数组不仅能够支持常规数组的下标索引（数字下标），还可以支持map类型的键值对索引。通过对_zend_array这个结构体结构可以看到使用一个gc变量来记录该HashTable被引用的次数（当gc值为0时会对这部分内存进行回收），另外重要的就是联合体u下边的变量。首先来了解一下HashTable是如何记录使用空间的大小、元素的个数以及如何扩容的。nNumUsed这个变量用于记录已使用的空间大小，包括跳过的和unset掉的。例如如下的php代码：
+	<?php
+		$arr = [];
+		$arr[1] = 1;
+		$arr[2] = 2;
+		unset($arr[2]);
+
+		$arr[] = 3;
+	?>
+	在这段代码执行到最后时，在HashTable结构体中nNumUsed的值为3，而对于nNumOfElements用于记录真正的元素个数，所以此时的值为1，因为最后在数组$arr中只有$arr[1] = 1这一个元素存在。而对于HashTable初始化的时候nTableSize的值为8，当内存空间不够之后会以两倍的大小进行扩容，即8，16，32，64,......的形式扩容，每次扩容都会进行一次rehash操作，从新计算hash值来存放元素。如上的代码中的$arr[] = 3；的赋值语句，由于HashTable使用了一个nNextFreeElement变量来记录了下一个数字索引的值，所以在执行这条赋值语句之前nNextFreeElement的值为3，即在数组$arr中$arr[3] = 3，赋值过后nNextFreeElement的自增，变为4，等待下一次的使用。另外，再来了解一下HashTable是如何来保存数据的。HashTable在做数据存储时分为了两个部分，一部分是索引数组部分部分，另一部分是存储数据的Bucket列表部分。而这两个部分都在arData这部分中，索引数组与Bucket列表一起分配，arData指向了Bucket列表的起始位置，而索引数组可以通过arData指针向前移动访问到，即arData[-1]、arData[-2]、......，在索引数组中存储的是Bucket元素在arData中的位置。插入一个元素会先将元素插入到Bucket数组中，插入位置为index,然后使用哈希函数对键（key）进行计算得到一个值h，这个值h再去与nTableMask参与运算（h | nTableMask）计算出索引数组中的位置，将index存入这个位置。查找的时候先根据key与nTableMask计算出索引数组的位置，然后获取到在Bucket数组中的位置index，最后通过index去Bucket数组中取出元素。
+	在插入的过程中会出现哈希碰撞的情况，哈希碰撞是指不同的键(key)可能计算出相同的哈希值，但这些值需要插入到一个hash表。常用的解决办法为将Bucket串成链表，在查找的时候遍历链表比较键，键相同就取出数据。这是解决哈希碰撞的常用方法，即拉链法。
+	当删除或插入数据达到一定的数量的时候，由于HashTable此时会做存储空间的变动，于是需要重建索引，因为元素所在的Bucket位置移动了，或哈希数组的nTableMask变化了导致原本的哈希索引变化，重建索引的的目的是重新计算数据的存储位置。
